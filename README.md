@@ -27,12 +27,17 @@ kept on disk.
 ## Install
 
 ```
+brew install zamua/tap/onlineonly
+```
+
+Or from source, with the Xcode command line tools (`xcode-select --install`):
+
+```
 git clone https://github.com/Zamua/onlineonly && cd onlineonly
 make && sudo make install              # or: make install PREFIX=~/.local
 ```
 
-Needs macOS 11+, the Xcode command line tools (`xcode-select --install`) and the Dropbox
-desktop app with its folder at `~/Dropbox`.
+Needs macOS 11+ and the Dropbox desktop app with its folder at `~/Dropbox`.
 
 ## CLI
 

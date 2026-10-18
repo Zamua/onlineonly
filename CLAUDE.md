@@ -28,6 +28,12 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 - The tool only sends an action Dropbox's own menu offers for the path, so a Dropbox change
   fails closed ("does not offer"), never as a different action.
 
+## Release
+
+Bump `src/version.h`, tag `vX.Y.Z` on `main`, then update `url` and `sha256` in
+`Formula/onlineonly.rb` in `Zamua/homebrew-tap`; the formula builds from the tag's source
+tarball, so a stale entry silently keeps serving the old version.
+
 ## Rules
 
 - Never commit Dropbox code, binaries, or material extracted from the Dropbox app.
