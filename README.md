@@ -119,8 +119,8 @@ the path settles and sends it again if nothing happens.
 - macOS only, and only the Dropbox app that keeps its folder at `~/Dropbox`. The File
   Provider version (`~/Library/CloudStorage/Dropbox`) works differently and is not supported.
 - The interface is undocumented and unsupported by Dropbox, so a Dropbox update can break
-  onlineonly. That shows up as "no reply" or "Dropbox does not offer ...", never as a wrong
-  action.
+  onlineonly. That shows up as "no reply", "unreadable reply" or "Dropbox does not offer
+  ...", never as a wrong action.
 - A placeholder reads as an empty file. Do not make online-only anything a program is
   actively using.
 
