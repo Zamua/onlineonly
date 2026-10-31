@@ -2,7 +2,6 @@
 // [int64 request id, NSKeyedArchiver payload]. Dropbox replies on the message's receive port
 // with the same id; acknowledgements carry an empty payload.
 #import "OODropbox.h"
-#import "OODomain.h"
 #include <unistd.h>
 
 // NSMachBootstrapServer and NSPortMessage are deprecated but remain the only Foundation API for
@@ -40,9 +39,36 @@ static NSKeyedUnarchiver *OpenReply(NSData *reply, NSString *key, NSString **err
   return u;
 }
 
-int OOStatusFromReply(NSData *reply, NSString **error) {
+NSString *OOTargetVerb(OOTarget target) {
+  return target == OOTargetOnlineOnly ? @"dod_evict" : @"dod_recall";
+}
+
+static void ParseInto(NSString *menu, NSMutableDictionary *verbs) {
+  for (NSString *item in [menu componentsSeparatedByString:@"|"]) {
+    NSArray<NSString *> *parts = [item componentsSeparatedByString:@"~"];
+    if (parts.count < 3) continue;
+    if ([parts containsObject:@"submenu"]) {
+      NSString *inner = parts.lastObject.stringByRemovingPercentEncoding;
+      if (inner) ParseInto(inner, verbs);
+      continue;
+    }
+    NSString *action = parts[2];
+    NSRange dash = [action rangeOfString:@"-" options:NSBackwardsSearch];
+    if (dash.location == NSNotFound || dash.location == 0 || NSMaxRange(dash) == action.length) continue;
+    verbs[[action substringToIndex:dash.location]] = [action substringFromIndex:NSMaxRange(dash)];
+  }
+}
+
+NSDictionary<NSString *, NSString *> *OOParseMenu(NSString *menu) {
+  NSMutableDictionary *verbs = [NSMutableDictionary new];
+  ParseInto(menu, verbs);
+  return verbs;
+}
+
+BOOL OOStatusFromReply(NSData *reply, OOStatus *status, NSString **error) {
   NSKeyedUnarchiver *u = OpenReply(reply, @"status", error);
-  return u ? [u decodeIntForKey:@"status"] : OOStatusNoReply;
+  if (u) *status = (OOStatus)[u decodeIntForKey:@"status"];
+  return u != nil;
 }
 
 NSDictionary<NSString *, NSString *> *OOVerbsFromReply(NSData *reply, NSString **error) {
@@ -123,20 +149,24 @@ NSDictionary<NSString *, NSString *> *OOVerbsFromReply(NSData *reply, NSString *
   return _reply;
 }
 
-- (int)statusOf:(NSString *)path error:(NSString **)error {
-  return OOStatusFromReply([self send:kStatus payload:@{@"url": [NSURL fileURLWithPath:path]}], error);
+- (BOOL)status:(OOStatus *)status of:(NSString *)path error:(NSString **)error {
+  return OOStatusFromReply([self send:kStatus payload:@{@"url": [NSURL fileURLWithPath:path]}], status, error);
 }
 
-- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path error:(NSString **)error {
-  return OOVerbsFromReply([self send:kContextMenu payload:@{@"pathlist": @[[NSURL fileURLWithPath:path]]}], error);
-}
-
-- (BOOL)perform:(NSString *)verb instance:(NSString *)instance path:(NSString *)path {
-  return [self send:kAction payload:@{
-    @"action": verb,
-    @"host_int": instance,
-    @"pathlist": @[[NSURL fileURLWithPath:path]],
-  }] != nil;
+// The menu supplies the account instance the action must name, and is the check that Dropbox
+// offers the action at all.
+- (OORequestResult)request:(OOTarget)target for:(NSString *)path error:(NSString **)error {
+  NSArray *pathlist = @[[NSURL fileURLWithPath:path]];
+  NSDictionary *verbs = OOVerbsFromReply([self send:kContextMenu payload:@{@"pathlist": pathlist}], error);
+  if (!verbs) return OORequestUnanswered;
+  NSString *verb = OOTargetVerb(target);
+  NSString *instance = verbs[verb];
+  if (!instance) return OORequestNotOffered;
+  if (![self send:kAction payload:@{@"action": verb, @"host_int": instance, @"pathlist": pathlist}]) {
+    if (error) *error = @"no reply from Dropbox";
+    return OORequestUnanswered;
+  }
+  return OORequestSent;
 }
 
 - (NSArray<NSString *> *)roots {

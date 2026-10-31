@@ -6,17 +6,26 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 
 ## Layout
 
-- `src/OODomain.{h,m}`: status codes, target actions, menu parsing. Pure.
-- `src/OOBackend.h`: the port the service needs (status, offered actions, perform). A
-  missing or malformed reply comes back with an error string, so it is never confused with a
-  real status or an empty set of offered actions. Dropbox's replies always carry their key
-  (`status`, `menu`), even for paths outside Dropbox, so a reply without it is malformed;
-  `OOStatusFromReply`/`OOVerbsFromReply` in `OODropbox.m` decode them and are unit-tested.
+- `src/OODomain.{h,m}`: status codes and target states. Pure, and free of Dropbox's wire
+  vocabulary.
+- `src/OOBackend.h`: the port the service needs, in domain terms: a path's status, and "move
+  this path toward a target if Dropbox offers it" (sent, not offered, or unanswered). A missing
+  or malformed reply comes back with an error string, so it is never confused with a real
+  status or an action Dropbox declined to offer.
 - `src/OODropbox.{h,m}`: the adapter to the Dropbox app. The wire format is described at the
-  top of the `.m`; everything Dropbox-specific stays in this file.
-- `src/OOService.{h,m}`: path resolution, folder listing, apply-with-wait (hold while
-  syncing, resend, timeouts).
-- `src/OOMCP.{h,m}`: JSON-RPC 2.0 over newline-delimited stdio; tools only.
+  top of the `.m`; everything Dropbox-specific stays in this file: the menu verbs, the menu
+  parser, and the reply decoders (`OOStatusFromReply`/`OOVerbsFromReply`, unit-tested).
+  Dropbox's replies always carry their key (`status`, `menu`), even for paths outside
+  Dropbox, so a reply without it is malformed.
+- `src/OOResult.{h,m}`: typed results (status report, folder entry and listing, apply result
+  with an `OOOutcome`) and their one JSON shape, which the CLI's `--json` and the MCP tools'
+  `structuredContent` both emit. `TestResultContract` pins that shape per outcome.
+- `src/OOService.{h,m}`: path resolution, status with an optional folder listing,
+  apply-with-wait (hold while syncing, resend, timeouts).
+- `src/OOMCP.{h,m}`: JSON-RPC 2.0 over newline-delimited stdio; tools only. `OOTool` is the
+  one tool table: definitions and dispatch are exhaustive switches over it. Arguments are
+  parsed once against the schema before anything runs; a present argument of the wrong type
+  is an error, an unknown key is ignored, and null counts as absent.
 - `src/main.m`: CLI. `src/version.h`: the version string, bumped at release.
 - `tests/tests.m`: unit tests against an in-memory `FakeBackend`; `tests/mcp_stdio.sh`
   drives the real binary over stdio. `make test` runs both and needs no Dropbox.
@@ -25,7 +34,8 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 
 - Dropbox silently drops a request sent while the path is `syncing` (a just-created file or
   folder). `OOService.apply` holds requests until the path settles and re-sends after
-  `resendInterval` if a settled path has not moved.
+  `resendInterval` if a settled path has not moved. Once one request has gone through, an
+  unanswered resend keeps waiting instead of failing the path.
 - Folder requests are recursive. Small trees flip in about a second.
 - Placeholders are 0-byte files with a `com.dropbox.placeholder` xattr; reading one returns 0
   bytes and does not download it.

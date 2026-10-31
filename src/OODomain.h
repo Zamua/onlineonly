@@ -2,9 +2,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-// Status codes the Dropbox client reports for a path (the Finder badge it would show).
+// Status codes the Dropbox client reports for a path (the Finder badge it would show). Other
+// codes can arrive from a newer client; OOStatusName names them unknown(N).
 typedef NS_ENUM(int, OOStatus) {
-  OOStatusNoReply = -1,
   OOStatusNone = 0,
   OOStatusOffline = 1,
   OOStatusSyncing = 2,
@@ -21,19 +21,12 @@ typedef NS_ENUM(NSInteger, OOTarget) {
   OOTargetOffline,
 };
 
-NSString *OOStatusName(int status);
-
-// Context-menu verb that moves a path to the target state.
-NSString *OOTargetVerb(OOTarget target);
+NSString *OOStatusName(OOStatus status);
 
 // The Finder menu title for the target action.
 NSString *OOTargetTitle(OOTarget target);
 
 // Status Dropbox reports once the target state is reached.
 OOStatus OOTargetStatus(OOTarget target);
-
-// Parses Dropbox's encoded context menu ("Title~Tooltip~verb-instance|...", submenus
-// percent-encoded inline) into {verb: account instance}.
-NSDictionary<NSString *, NSString *> *OOParseMenu(NSString *menu);
 
 NS_ASSUME_NONNULL_END
