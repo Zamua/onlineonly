@@ -50,42 +50,121 @@ static NSDictionary *ApplySchema(void) {
   };
 }
 
-static NSArray *Tools(void) {
-  return @[
-    @{
-      @"name": @"get_sync_status",
-      @"title": @"Get Dropbox sync status",
-      @"description": @"Report whether files or folders in the local Dropbox folder are on disk or online-only: \"online-only\" (a 0-byte placeholder on disk, content in the cloud), \"offline\" (downloaded and kept on this computer), \"local\" (downloaded, but Dropbox may reclaim the space), \"syncing\", \"mixed\", \"error\", \"ignored\", \"locked\", or \"none\" (not managed by Dropbox). A folder's status is its own setting; its children can differ, so set include_children to see each entry.",
-      @"inputSchema": @{
-        @"type": @"object",
-        @"properties": @{
-          @"paths": PathsSchema(),
-          @"include_children": @{
-            @"type": @"boolean",
-            @"default": @NO,
-            @"description": @"For folders, also list the status of each immediate child.",
+typedef NS_ENUM(NSInteger, OOTool) {
+  OOToolGetSyncStatus,
+  OOToolMakeOnlineOnly,
+  OOToolMakeAvailableOffline,
+};
+
+// tools/list order. Definitions and dispatch are exhaustive switches over OOTool, so a listed
+// tool cannot lack either.
+static const OOTool kTools[] = {OOToolGetSyncStatus, OOToolMakeOnlineOnly, OOToolMakeAvailableOffline};
+
+static NSDictionary *ToolDefinition(OOTool tool) {
+  switch (tool) {
+    case OOToolGetSyncStatus:
+      return @{
+        @"name": @"get_sync_status",
+        @"title": @"Get Dropbox sync status",
+        @"description": @"Report whether files or folders in the local Dropbox folder are on disk or online-only: \"online-only\" (a 0-byte placeholder on disk, content in the cloud), \"offline\" (downloaded and kept on this computer), \"local\" (downloaded, but Dropbox may reclaim the space), \"syncing\", \"mixed\", \"error\", \"ignored\", \"locked\", or \"none\" (not managed by Dropbox). A folder's status is its own setting; its children can differ, so set include_children to see each entry.",
+        @"inputSchema": @{
+          @"type": @"object",
+          @"properties": @{
+            @"paths": PathsSchema(),
+            @"include_children": @{
+              @"type": @"boolean",
+              @"default": @NO,
+              @"description": @"For folders, also list the status of each immediate child.",
+            },
           },
+          @"required": @[@"paths"],
+          @"additionalProperties": @NO,
         },
-        @"required": @[@"paths"],
-        @"additionalProperties": @NO,
-      },
-      @"annotations": @{@"readOnlyHint": @YES, @"openWorldHint": @NO},
-    },
-    @{
-      @"name": @"make_online_only",
-      @"title": @"Make online-only",
-      @"description": @"Free disk space by making files or folders online-only: Dropbox deletes the local copies, leaving 0-byte placeholders, and keeps the content in the cloud. Folders apply recursively. Programs that read a placeholder get an empty file, so do not use this on anything in active use (code checkouts, app data, files a running program needs). Reverse it with make_available_offline.",
-      @"inputSchema": ApplySchema(),
-      @"annotations": @{@"readOnlyHint": @NO, @"destructiveHint": @YES, @"idempotentHint": @YES, @"openWorldHint": @NO},
-    },
-    @{
-      @"name": @"make_available_offline",
-      @"title": @"Make available offline",
-      @"description": @"Download files or folders from Dropbox and keep them on this computer (Dropbox's \"Make available offline\"). Folders apply recursively; a large folder can take a while and use a lot of disk space.",
-      @"inputSchema": ApplySchema(),
-      @"annotations": @{@"readOnlyHint": @NO, @"destructiveHint": @NO, @"idempotentHint": @YES, @"openWorldHint": @NO},
-    },
-  ];
+        @"annotations": @{@"readOnlyHint": @YES, @"openWorldHint": @NO},
+      };
+    case OOToolMakeOnlineOnly:
+      return @{
+        @"name": @"make_online_only",
+        @"title": @"Make online-only",
+        @"description": @"Free disk space by making files or folders online-only: Dropbox deletes the local copies, leaving 0-byte placeholders, and keeps the content in the cloud. Folders apply recursively. Programs that read a placeholder get an empty file, so do not use this on anything in active use (code checkouts, app data, files a running program needs). Reverse it with make_available_offline.",
+        @"inputSchema": ApplySchema(),
+        @"annotations": @{@"readOnlyHint": @NO, @"destructiveHint": @YES, @"idempotentHint": @YES, @"openWorldHint": @NO},
+      };
+    case OOToolMakeAvailableOffline:
+      return @{
+        @"name": @"make_available_offline",
+        @"title": @"Make available offline",
+        @"description": @"Download files or folders from Dropbox and keep them on this computer (Dropbox's \"Make available offline\"). Folders apply recursively; a large folder can take a while and use a lot of disk space.",
+        @"inputSchema": ApplySchema(),
+        @"annotations": @{@"readOnlyHint": @NO, @"destructiveHint": @NO, @"idempotentHint": @YES, @"openWorldHint": @NO},
+      };
+  }
+}
+
+static BOOL ToolNamed(id name, OOTool *tool) {
+  for (size_t i = 0; i < sizeof kTools / sizeof *kTools; i++) {
+    if ([ToolDefinition(kTools[i])[@"name"] isEqual:name]) {
+      *tool = kTools[i];
+      return YES;
+    }
+  }
+  return NO;
+}
+
+// tools/call arguments, checked against the tool's schema once, before anything runs. Keys the
+// schema does not name are ignored; JSON null counts as absent.
+@interface OOToolArgs : NSObject
+@property NSArray<NSString *> *paths;
+@property BOOL includeChildren;
+@property BOOL wait;
+@property NSTimeInterval timeout;
+@end
+
+@implementation OOToolArgs
+@end
+
+static BOOL IsBool(id v) {
+  return [v isKindOfClass:[NSNumber class]] && CFGetTypeID((__bridge CFTypeRef)v) == CFBooleanGetTypeID();
+}
+
+static id Arg(NSDictionary *args, NSString *key) {
+  id v = args[key];
+  return v == [NSNull null] ? nil : v;
+}
+
+// nil when the arguments fit the tool's schema, otherwise what is wrong with them.
+static NSString *ParseArgs(OOTool tool, NSDictionary *args, OOToolArgs *out) {
+  NSArray *paths = Arg(args, @"paths");
+  BOOL validPaths = [paths isKindOfClass:[NSArray class]] && paths.count > 0;
+  for (id p in validPaths ? paths : @[]) validPaths = validPaths && [p isKindOfClass:[NSString class]] && [p length] > 0;
+  if (!validPaths) return @"paths must be a non-empty array of path strings";
+  out.paths = paths;
+
+  switch (tool) {
+    case OOToolGetSyncStatus: {
+      id children = Arg(args, @"include_children");
+      if (children && !IsBool(children)) return @"include_children must be a boolean";
+      out.includeChildren = [children boolValue];
+      return nil;
+    }
+    case OOToolMakeOnlineOnly:
+    case OOToolMakeAvailableOffline: {
+      id wait = Arg(args, @"wait"), timeout = Arg(args, @"timeout_seconds");
+      if (wait && !IsBool(wait)) return @"wait must be a boolean";
+      if (timeout && (![timeout isKindOfClass:[NSNumber class]] || IsBool(timeout) ||
+                      [timeout doubleValue] < 0 || [timeout doubleValue] > kMaxTimeout))
+        return [NSString stringWithFormat:@"timeout_seconds must be a number from 0 to %g", kMaxTimeout];
+      out.wait = wait ? [wait boolValue] : YES;
+      out.timeout = timeout ? [timeout doubleValue] : kDefaultTimeout;
+      return nil;
+    }
+  }
+}
+
+static NSArray *Tools(void) {
+  NSMutableArray *tools = [NSMutableArray new];
+  for (size_t i = 0; i < sizeof kTools / sizeof *kTools; i++) [tools addObject:ToolDefinition(kTools[i])];
+  return tools;
 }
 
 static NSString *Serialize(id obj) {
@@ -141,13 +220,16 @@ static NSDictionary *ToolResult(id payload, BOOL isError) {
   if ([method isEqualToString:@"ping"]) return [self result:@{} id:rid];
   if ([method isEqualToString:@"tools/list"]) return [self result:@{@"tools": Tools()} id:rid];
   if ([method isEqualToString:@"tools/call"]) {
-    NSString *name = params[@"name"];
+    OOTool tool;
+    if (!ToolNamed(params[@"name"], &tool))
+      return [self error:kInvalidParams message:[NSString stringWithFormat:@"Unknown tool: %@", params[@"name"]] id:rid];
     id args = params[@"arguments"] ?: @{};
-    if (![name isKindOfClass:[NSString class]] || ![[Tools() valueForKey:@"name"] containsObject:name])
-      return [self error:kInvalidParams message:[NSString stringWithFormat:@"Unknown tool: %@", name] id:rid];
     if (![args isKindOfClass:[NSDictionary class]])
       return [self result:ToolResult(@"arguments must be an object", YES) id:rid];
-    return [self result:[self callTool:name args:args] id:rid];
+    OOToolArgs *parsed = [OOToolArgs new];
+    NSString *invalid = ParseArgs(tool, args, parsed);
+    if (invalid) return [self result:ToolResult(invalid, YES) id:rid];
+    return [self result:[self call:tool args:parsed] id:rid];
   }
   return [self error:kMethodNotFound message:[NSString stringWithFormat:@"Method not found: %@", method] id:rid];
 }
@@ -164,48 +246,35 @@ static NSDictionary *ToolResult(id payload, BOOL isError) {
   };
 }
 
-- (NSDictionary *)callTool:(NSString *)name args:(NSDictionary *)args {
-  NSArray *paths = args[@"paths"];
-  BOOL validPaths = [paths isKindOfClass:[NSArray class]] && paths.count > 0;
-  for (id p in validPaths ? paths : @[]) validPaths = validPaths && [p isKindOfClass:[NSString class]] && [p length] > 0;
-  if (!validPaths) return ToolResult(@"paths must be a non-empty array of path strings", YES);
-
+- (NSDictionary *)call:(OOTool)tool args:(OOToolArgs *)args {
   id<OOBackend> backend = _connector();
   if (!backend) return ToolResult(@"Dropbox is not running on this computer, or it is not the classic client with a ~/Dropbox folder.", YES);
   OOService *service = [[OOService alloc] initWithBackend:backend];
   service.pollInterval = _pollInterval;
 
-  if ([name isEqualToString:@"get_sync_status"]) {
-    BOOL children = [args[@"include_children"] respondsToSelector:@selector(boolValue)] && [args[@"include_children"] boolValue];
-    NSMutableArray *out = [NSMutableArray new];
-    BOOL anyError = NO;
-    for (NSString *p in paths) {
-      NSMutableDictionary *r = [[service statusOf:p] mutableCopy];
-      anyError = anyError || r[@"error"] != nil;
-      BOOL isDir = NO;
-      if (children && !r[@"error"] && [[NSFileManager defaultManager] fileExistsAtPath:r[@"path"] isDirectory:&isDir] && isDir) {
-        BOOL truncated = NO;
-        NSString *err;
-        NSArray *kids = [service childrenOf:r[@"path"] limit:kChildLimit truncated:&truncated error:&err];
-        if (kids) {
-          r[@"children"] = kids;
-          if (truncated) r[@"children_truncated"] = @YES;
-        } else {
-          r[@"children_error"] = err;
-        }
-      }
-      [out addObject:r];
-    }
-    return ToolResult(@{@"results": out}, anyError);
+  switch (tool) {
+    case OOToolGetSyncStatus: return [self statusWith:service args:args];
+    case OOToolMakeOnlineOnly: return [self apply:OOTargetOnlineOnly with:service args:args];
+    case OOToolMakeAvailableOffline: return [self apply:OOTargetOffline with:service args:args];
   }
+}
 
-  OOTarget target = [name isEqualToString:@"make_online_only"] ? OOTargetOnlineOnly : OOTargetOffline;
-  BOOL wait = [args[@"wait"] respondsToSelector:@selector(boolValue)] ? [args[@"wait"] boolValue] : YES;
-  NSTimeInterval timeout = [args[@"timeout_seconds"] respondsToSelector:@selector(doubleValue)] ? [args[@"timeout_seconds"] doubleValue] : kDefaultTimeout;
-  timeout = MAX(0, MIN(timeout, kMaxTimeout));
-  NSArray *results = [service apply:target paths:paths wait:wait timeout:timeout];
-  BOOL anyFailed = [[results valueForKey:@"result"] containsObject:OOResultFailed];
-  return ToolResult(@{@"results": results}, anyFailed);
+- (NSDictionary *)statusWith:(OOService *)service args:(OOToolArgs *)args {
+  NSMutableArray<OOStatusReport *> *reports = [NSMutableArray new];
+  BOOL anyError = NO;
+  for (NSString *p in args.paths) {
+    OOStatusReport *r = args.includeChildren ? [service statusOf:p childLimit:kChildLimit] : [service statusOf:p];
+    anyError = anyError || r.error;
+    [reports addObject:r];
+  }
+  return ToolResult(OOResultsJSON(reports), anyError);
+}
+
+- (NSDictionary *)apply:(OOTarget)target with:(OOService *)service args:(OOToolArgs *)args {
+  NSArray<OOApplyResult *> *results = [service apply:target paths:args.paths wait:args.wait timeout:args.timeout];
+  BOOL anyFailed = NO;
+  for (OOApplyResult *r in results) anyFailed = anyFailed || r.outcome == OOOutcomeFailed;
+  return ToolResult(OOResultsJSON(results), anyFailed);
 }
 
 - (NSString *)result:(id)result id:(id)rid {

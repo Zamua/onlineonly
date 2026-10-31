@@ -82,49 +82,46 @@ int main(int argc, char **argv) {
     int rc = 0;
 
     if ([cmd isEqualToString:@"status"]) {
-      NSMutableArray *results = [NSMutableArray new];
+      NSMutableArray<OOStatusReport *> *reports = [NSMutableArray new];
       for (NSString *p in paths) {
-        NSDictionary *r = [service statusOf:p];
-        [results addObject:r];
-        if (r[@"error"]) {
-          rc = 1;
-          if (!json) fprintf(stderr, "onlineonly: %s: %s\n", p.UTF8String, [r[@"error"] UTF8String]);
-        } else if (!json) {
-          printf("%-12s %s\n", [r[@"status"] UTF8String], [r[@"path"] UTF8String]);
-        }
+        OOStatusReport *r = [service statusOf:p];
+        [reports addObject:r];
+        if (r.error) rc = 1;
+        if (json) continue;
+        if (r.error) fprintf(stderr, "onlineonly: %s: %s\n", p.UTF8String, r.error.UTF8String);
+        else printf("%-12s %s\n", OOStatusName(r.status).UTF8String, r.path.UTF8String);
       }
-      if (json) PrintJSON(@{@"results": results});
+      if (json) PrintJSON(OOResultsJSON(reports));
     } else if ([cmd isEqualToString:@"ls"]) {
       if (paths.count != 1) Usage();
-      NSString *err;
-      NSArray *kids = [service childrenOf:paths[0] limit:NSUIntegerMax truncated:NULL error:&err];
-      if (!kids) {
-        fprintf(stderr, "onlineonly: %s: %s\n", paths[0].UTF8String, err.UTF8String);
+      OOListing *listing = [service childrenOf:paths[0] limit:NSUIntegerMax];
+      if (listing.error) {
+        fprintf(stderr, "onlineonly: %s: %s\n", paths[0].UTF8String, listing.error.UTF8String);
         return 1;
       }
-      if (json) PrintJSON(@{@"results": kids});
-      for (NSDictionary *k in json ? @[] : kids)
-        printf("%-12s %s%s\n", [k[@"status"] UTF8String], [k[@"name"] UTF8String], [k[@"directory"] boolValue] ? "/" : "");
+      for (OOEntry *e in listing.entries) {
+        if (e.report.error) rc = 1;
+        if (json) continue;
+        if (e.report.error) fprintf(stderr, "onlineonly: %s: %s\n", e.report.path.UTF8String, e.report.error.UTF8String);
+        else printf("%-12s %s%s\n", OOStatusName(e.report.status).UTF8String, e.name.UTF8String, e.directory ? "/" : "");
+      }
+      if (json) PrintJSON(OOResultsJSON(listing.entries));
     } else if ([cmd isEqualToString:@"online"] || [cmd isEqualToString:@"offline"]) {
       OOTarget target = [cmd isEqualToString:@"online"] ? OOTargetOnlineOnly : OOTargetOffline;
-      NSArray *results = [service apply:target paths:paths wait:wait timeout:timeout];
-      for (NSDictionary *r in results) {
-        NSString *result = r[@"result"];
-        if ([result isEqualToString:OOResultFailed] || [result isEqualToString:OOResultPending]) rc = 1;
+      NSArray<OOApplyResult *> *results = [service apply:target paths:paths wait:wait timeout:timeout];
+      for (OOApplyResult *r in results) {
+        if (r.outcome == OOOutcomeFailed || r.outcome == OOOutcomePending) rc = 1;
         if (json) continue;
-        const char *path = [r[@"path"] UTF8String];
-        if ([result isEqualToString:OOResultFailed])
-          fprintf(stderr, "onlineonly: %s: %s\n", path, [r[@"error"] UTF8String]);
-        else if ([result isEqualToString:OOResultPending])
-          fprintf(stderr, "onlineonly: %s: timed out waiting (status: %s)\n", path, [r[@"status"] UTF8String]);
-        else if ([result isEqualToString:OOResultAlready])
-          printf("already %s: %s\n", [r[@"status"] UTF8String], path);
-        else if ([result isEqualToString:OOResultDone])
-          printf("%-12s %s\n", [r[@"status"] UTF8String], path);
-        else
-          printf("requested %s: %s\n", cmd.UTF8String, path);
+        const char *path = r.path.UTF8String, *status = OOStatusName(r.status).UTF8String;
+        switch (r.outcome) {
+          case OOOutcomeFailed: fprintf(stderr, "onlineonly: %s: %s\n", path, r.error.UTF8String); break;
+          case OOOutcomePending: fprintf(stderr, "onlineonly: %s: timed out waiting (status: %s)\n", path, status); break;
+          case OOOutcomeAlready: printf("already %s: %s\n", status, path); break;
+          case OOOutcomeDone: printf("%-12s %s\n", status, path); break;
+          case OOOutcomeRequested: printf("requested %s: %s\n", cmd.UTF8String, path); break;
+        }
       }
-      if (json) PrintJSON(@{@"results": results});
+      if (json) PrintJSON(OOResultsJSON(results));
     } else {
       Usage();
     }

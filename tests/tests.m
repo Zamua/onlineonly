@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import "../src/OODomain.h"
 #import "../src/OODropbox.h"
 #import "../src/OOMCP.h"
 #import "../src/OOService.h"
@@ -17,24 +16,29 @@ static int failures = 0, checks = 0;
 
 #define CHECK_EQ(a, b) CHECK([(a) isEqual:(b)])
 
-// In-memory Dropbox: per-path status and offered verbs. A performed verb lands after
-// `settleAfter` further status reads, standing in for Dropbox applying it asynchronously.
-// Like the real client, it drops a verb performed while the path is syncing, and drops the
-// next `dropNext` verbs outright.
+// In-memory Dropbox: per-path status and the actions its menu offers. A request lands after
+// `settleAfter` further status reads, standing in for Dropbox applying it asynchronously. Like
+// the real client, it drops a request made while the path is syncing, and drops the next
+// `dropNext` requests outright.
 @interface FakeBackend : NSObject <OOBackend>
 @property NSMutableDictionary<NSString *, NSNumber *> *statuses;
-@property NSMutableArray<NSArray *> *performed;
+// [target, path] per acknowledged request.
+@property NSMutableArray<NSArray *> *requested;
 @property int settleAfter;
 @property BOOL silent;
+// Status reads for these paths get no reply.
+@property NSMutableSet<NSString *> *silentPaths;
 // Status requests answer, but context-menu requests get no reply.
 @property BOOL menuSilent;
-// Dropbox answers the context-menu request but offers no verbs.
+// Dropbox answers the context-menu request but offers no actions.
 @property BOOL menuEmpty;
+// How many more requests it acknowledges once the menu offers the action; -1 for all.
+@property int acks;
 @property int dropNext;
 // Sets a status outright, dropping any change still in flight.
-- (void)set:(NSString *)path to:(int)status;
+- (void)set:(NSString *)path to:(OOStatus)status;
 // Reports syncing for `reads` status reads, then `status`.
-- (void)syncing:(NSString *)path reads:(int)reads then:(int)status;
+- (void)syncing:(NSString *)path reads:(int)reads then:(OOStatus)status;
 @end
 
 @implementation FakeBackend {
@@ -44,26 +48,32 @@ static int failures = 0, checks = 0;
 - (instancetype)init {
   if ((self = [super init])) {
     _statuses = [NSMutableDictionary new];
-    _performed = [NSMutableArray new];
+    _requested = [NSMutableArray new];
+    _silentPaths = [NSMutableSet new];
     _inFlight = [NSMutableDictionary new];
+    _acks = -1;
   }
   return self;
 }
 
-- (void)set:(NSString *)path to:(int)status {
+- (void)set:(NSString *)path to:(OOStatus)status {
   [_inFlight removeObjectForKey:path];
   _statuses[path] = @(status);
 }
 
-- (void)syncing:(NSString *)path reads:(int)reads then:(int)status {
+- (void)syncing:(NSString *)path reads:(int)reads then:(OOStatus)status {
   _statuses[path] = @(OOStatusSyncing);
   _inFlight[path] = @[@(status), @(reads)];
 }
 
-- (int)statusOf:(NSString *)path error:(NSString **)error {
-  if (_silent) {
+- (OOStatus)current:(NSString *)path {
+  return _statuses[path] ? (OOStatus)_statuses[path].intValue : OOStatusNone;
+}
+
+- (BOOL)status:(OOStatus *)status of:(NSString *)path error:(NSString **)error {
+  if (_silent || [_silentPaths containsObject:path]) {
     if (error) *error = @"no reply from Dropbox";
-    return OOStatusNoReply;
+    return NO;
   }
   NSArray *f = _inFlight[path];
   if (f) {
@@ -75,32 +85,36 @@ static int failures = 0, checks = 0;
       _inFlight[path] = @[f[0], @(left - 1)];
     }
   }
-  return _statuses[path] ? _statuses[path].intValue : OOStatusNone;
+  *status = [self current:path];
+  return YES;
 }
 
-- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path error:(NSString **)error {
+// Like the real menu: nothing outside Dropbox, and only the action that changes the state.
+- (BOOL)offers:(OOTarget)target for:(NSString *)path {
+  OOStatus s = [self current:path];
+  if (_menuEmpty || s == OOStatusNone) return NO;
+  return s != OOTargetStatus(target);
+}
+
+- (OORequestResult)request:(OOTarget)target for:(NSString *)path error:(NSString **)error {
   if (_silent || _menuSilent) {
     if (error) *error = @"no reply from Dropbox";
-    return nil;
+    return OORequestUnanswered;
   }
-  if (_menuEmpty) return @{};
-  int s = _statuses[path] ? _statuses[path].intValue : OOStatusNone;
-  if (s == OOStatusNone) return @{@"copy_link": @"42"};
-  if (s == OOStatusOnlineOnly) return @{@"dod_recall": @"42", @"copy_link": @"42"};
-  if (s == OOStatusOffline) return @{@"dod_evict": @"42"};
-  return @{@"dod_evict": @"42", @"dod_recall": @"42"};
-}
-
-- (BOOL)perform:(NSString *)verb instance:(NSString *)instance path:(NSString *)path {
-  [_performed addObject:@[verb, instance, path]];
-  if (_statuses[path].intValue == OOStatusSyncing) return YES;
+  if (![self offers:target for:path]) return OORequestNotOffered;
+  if (_acks == 0) {
+    if (error) *error = @"no reply from Dropbox";
+    return OORequestUnanswered;
+  }
+  if (_acks > 0) _acks--;
+  [_requested addObject:@[@(target), path]];
+  if ([self current:path] == OOStatusSyncing) return OORequestSent;
   if (_dropNext > 0) {
     _dropNext--;
-    return YES;
+    return OORequestSent;
   }
-  int to = [verb isEqualToString:@"dod_evict"] ? OOStatusOnlineOnly : OOStatusOffline;
-  _inFlight[path] = @[@(to), @(_settleAfter)];
-  return YES;
+  _inFlight[path] = @[@(OOTargetStatus(target)), @(_settleAfter)];
+  return OORequestSent;
 }
 
 @end
@@ -145,26 +159,27 @@ static void TestReplies(void) {
 
   // A missing reply, an undecodable one and one without the expected key are each named,
   // never passed off as a status or as "no verbs offered".
-  CHECK(OOStatusFromReply(nil, &err) == OOStatusNoReply);
+  OOStatus status = OOStatusLocked;
+  CHECK(!OOStatusFromReply(nil, &status, &err));
   CHECK_EQ(err, @"no reply from Dropbox");
 
   err = nil;
-  CHECK(OOStatusFromReply([@"garbage" dataUsingEncoding:NSUTF8StringEncoding], &err) == OOStatusNoReply);
+  CHECK(!OOStatusFromReply([@"garbage" dataUsingEncoding:NSUTF8StringEncoding], &status, &err));
   CHECK([err hasPrefix:@"unreadable reply from Dropbox"]);
 
   err = nil;
   NSData *noStatus = Archive(^(NSKeyedArchiver *a) { [a encodeObject:@"x" forKey:@"other"]; });
-  CHECK(OOStatusFromReply(noStatus, &err) == OOStatusNoReply);
+  CHECK(!OOStatusFromReply(noStatus, &status, &err));
   CHECK_EQ(err, @"reply from Dropbox has no status");
 
   err = nil;
   NSData *online = Archive(^(NSKeyedArchiver *a) { [a encodeInt:OOStatusOnlineOnly forKey:@"status"]; });
-  CHECK(OOStatusFromReply(online, &err) == OOStatusOnlineOnly);
+  CHECK(OOStatusFromReply(online, &status, &err) && status == OOStatusOnlineOnly);
   CHECK(err == nil);
 
   // Status 0 is a real answer (not in a Dropbox folder), distinct from a missing key.
   NSData *none = Archive(^(NSKeyedArchiver *a) { [a encodeInt:0 forKey:@"status"]; });
-  CHECK(OOStatusFromReply(none, &err) == OOStatusNone);
+  CHECK(OOStatusFromReply(none, &status, &err) && status == OOStatusNone);
 
   err = nil;
   CHECK(OOVerbsFromReply(nil, &err) == nil);
@@ -198,114 +213,140 @@ static void TestApply(void) {
   OOService *svc = [[OOService alloc] initWithBackend:fake];
   svc.pollInterval = 0;
 
-  // A requested change sends the offered verb with its account instance, without waiting.
+  // A requested change is sent for the target, without waiting.
   [fake set:file to:OOStatusLocal];
-  NSDictionary *r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultRequested);
-  CHECK_EQ(fake.performed.lastObject, (@[@"dod_evict", @"42", file]));
+  OOApplyResult *r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:5][0];
+  CHECK(r.outcome == OOOutcomeRequested);
+  CHECK_EQ(fake.requested.lastObject, (@[@(OOTargetOnlineOnly), file]));
 
   // Waiting returns done once the backend reports the target status.
   [fake set:file to:OOStatusLocal];
   fake.settleAfter = 3;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultDone);
-  CHECK_EQ(r[@"status"], @"online-only");
+  CHECK(r.outcome == OOOutcomeDone);
+  CHECK(r.hasStatus && r.status == OOStatusOnlineOnly);
 
   // A path already in the target state is reported, not re-sent.
-  NSUInteger sent = fake.performed.count;
+  NSUInteger sent = fake.requested.count;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultAlready);
-  CHECK(fake.performed.count == sent);
+  CHECK(r.outcome == OOOutcomeAlready);
+  CHECK(fake.requested.count == sent);
 
   // A change that never lands within the timeout is pending, not failed.
   [fake set:file to:OOStatusOnlineOnly];
   fake.settleAfter = 1000000;
   r = [svc apply:OOTargetOffline paths:@[file] wait:YES timeout:0.05][0];
-  CHECK_EQ(r[@"result"], OOResultPending);
+  CHECK(r.outcome == OOOutcomePending);
 
   // Paths outside Dropbox, missing paths and a silent Dropbox each fail with a reason.
   [fake.statuses removeAllObjects];
   r = [svc apply:OOTargetOffline paths:@[file] wait:NO timeout:0][0];
-  CHECK_EQ(r[@"result"], OOResultFailed);
-  CHECK_EQ(r[@"error"], @"not in a Dropbox folder");
+  CHECK(r.outcome == OOOutcomeFailed);
+  CHECK_EQ(r.error, @"not in a Dropbox folder");
   r = [svc apply:OOTargetOffline paths:@[@"/nonexistent/onlineonly"] wait:NO timeout:0][0];
-  CHECK_EQ(r[@"result"], OOResultFailed);
+  CHECK(r.outcome == OOOutcomeFailed);
   fake.silent = YES;
   r = [svc apply:OOTargetOffline paths:@[file] wait:NO timeout:0][0];
-  CHECK_EQ(r[@"error"], @"no reply from Dropbox");
+  CHECK_EQ(r.error, @"no reply from Dropbox");
   fake.silent = NO;
 
   // An unanswered menu request is a missing reply, not a verb Dropbox declined to offer.
   [fake set:file to:OOStatusLocal];
   fake.menuSilent = YES;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:0][0];
-  CHECK_EQ(r[@"result"], OOResultFailed);
-  CHECK_EQ(r[@"error"], @"no reply from Dropbox");
+  CHECK(r.outcome == OOOutcomeFailed);
+  CHECK_EQ(r.error, @"no reply from Dropbox");
   fake.menuSilent = NO;
 
-  // An answered menu without the verb is what "does not offer" means.
+  // An action Dropbox never acknowledges fails with the adapter's reason.
+  fake.acks = 0;
+  r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:0][0];
+  CHECK(r.outcome == OOOutcomeFailed);
+  CHECK_EQ(r.error, @"no reply from Dropbox");
+  fake.acks = -1;
+
+  // An answered menu without the action is what "does not offer" means.
   fake.menuEmpty = YES;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:0][0];
-  CHECK_EQ(r[@"error"], @"Dropbox does not offer Make online-only for this path");
+  CHECK_EQ(r.error, @"Dropbox does not offer Make online-only for this path");
   fake.menuEmpty = NO;
 
   // A status read with no answer carries the reason rather than passing as a status.
   fake.silent = YES;
-  CHECK_EQ([svc statusOf:file][@"error"], @"no reply from Dropbox");
+  CHECK_EQ([svc statusOf:file].error, @"no reply from Dropbox");
   fake.silent = NO;
 
   // A path that is still syncing is requested only once it settles, since Dropbox drops
   // requests made mid-sync.
-  [fake.performed removeAllObjects];
+  [fake.requested removeAllObjects];
   [fake syncing:file reads:3 then:OOStatusLocal];
   fake.settleAfter = 1;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultDone);
-  CHECK(fake.performed.count == 1);
+  CHECK(r.outcome == OOOutcomeDone);
+  CHECK(fake.requested.count == 1);
 
   // Without wait, the request is still held until the path settles.
-  [fake.performed removeAllObjects];
+  [fake.requested removeAllObjects];
   [fake syncing:file reads:3 then:OOStatusOnlineOnly];
   r = [svc apply:OOTargetOffline paths:@[file] wait:NO timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultRequested);
-  CHECK(fake.performed.count == 1);
+  CHECK(r.outcome == OOOutcomeRequested);
+  CHECK(fake.requested.count == 1);
 
   // A path that keeps syncing past the hold is pending and was never requested.
-  [fake.performed removeAllObjects];
+  [fake.requested removeAllObjects];
   [fake syncing:file reads:1000000 then:OOStatusLocal];
   svc.settleTimeout = 0.05;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultPending);
-  CHECK(fake.performed.count == 0);
+  CHECK(r.outcome == OOOutcomePending);
+  CHECK(fake.requested.count == 0);
 
   // A dropped request is re-sent once the settled path has not moved for resendInterval.
   [fake set:file to:OOStatusLocal];
   fake.dropNext = 1;
   svc.resendInterval = 0.01;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:5][0];
-  CHECK_EQ(r[@"result"], OOResultDone);
-  CHECK(fake.performed.count == 2);
+  CHECK(r.outcome == OOOutcomeDone);
+  CHECK(fake.requested.count == 2);
+
+  // Once a request went through, an unanswered resend keeps waiting rather than failing.
+  [fake.requested removeAllObjects];
+  [fake set:file to:OOStatusLocal];
+  fake.dropNext = 1;
+  fake.acks = 1;
+  r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:0.1][0];
+  CHECK(r.outcome == OOOutcomePending);
+  CHECK(r.error == nil);
+  CHECK(fake.requested.count == 1);
+  fake.acks = -1;
 
   // Results keep input order across mixed outcomes.
   [fake set:file to:OOStatusOffline];
-  NSArray *rs = [svc apply:OOTargetOffline paths:@[@"/nonexistent/x", file] wait:NO timeout:0];
-  CHECK_EQ(rs[0][@"result"], OOResultFailed);
-  CHECK_EQ(rs[1][@"result"], OOResultAlready);
+  NSArray<OOApplyResult *> *rs = [svc apply:OOTargetOffline paths:@[@"/nonexistent/x", file] wait:NO timeout:0];
+  CHECK(rs[0].outcome == OOOutcomeFailed);
+  CHECK(rs[1].outcome == OOOutcomeAlready);
 }
 
 static void TestChildren(void) {
   // Listing skips dot files, marks folders, and honors the limit.
   NSString *dir = TempDir();
   OOService *svc = [[OOService alloc] initWithBackend:[FakeBackend new]];
-  BOOL truncated = YES;
-  NSArray *kids = [svc childrenOf:dir limit:10 truncated:&truncated error:NULL];
-  CHECK_EQ([kids valueForKey:@"name"], (@[@"a.txt", @"sub"]));
-  CHECK_EQ([kids valueForKey:@"directory"], (@[@NO, @YES]));
-  CHECK(!truncated);
-  kids = [svc childrenOf:dir limit:1 truncated:&truncated error:NULL];
-  CHECK(kids.count == 1 && truncated);
-  NSString *err;
-  CHECK([svc childrenOf:@"/nonexistent/onlineonly" limit:1 truncated:NULL error:&err] == nil && err.length);
+  OOListing *l = [svc childrenOf:dir limit:10];
+  NSMutableArray *names = [NSMutableArray new], *dirs = [NSMutableArray new];
+  for (OOEntry *e in l.entries) {
+    [names addObject:e.name];
+    [dirs addObject:@(e.directory)];
+  }
+  CHECK_EQ(names, (@[@"a.txt", @"sub"]));
+  CHECK_EQ(dirs, (@[@NO, @YES]));
+  CHECK(!l.truncated && !l.error);
+  l = [svc childrenOf:dir limit:1];
+  CHECK(l.entries.count == 1 && l.truncated);
+  l = [svc childrenOf:@"/nonexistent/onlineonly" limit:1];
+  CHECK(l.error.length && l.entries.count == 0);
+
+  // A folder read with children carries its listing; a file never does.
+  CHECK([svc statusOf:dir childLimit:10].children.entries.count == 2);
+  CHECK([svc statusOf:[dir stringByAppendingPathComponent:@"a.txt"] childLimit:10].children == nil);
 }
 
 static id Call(OOMCPServer *s, NSString *line) {
@@ -372,21 +413,90 @@ static void TestMCP(void) {
   fake.settleAfter = 2;
   r = Call(s, Req(8, @"tools/call", @{@"name": @"make_online_only", @"arguments": @{@"paths": @[file]}}))[@"result"];
   CHECK_EQ(r[@"isError"], @NO);
-  CHECK_EQ(r[@"structuredContent"][@"results"][0][@"result"], OOResultDone);
+  CHECK_EQ(r[@"structuredContent"][@"results"][0][@"result"], @"done");
 
   // wait=false only requests the change.
   r = Call(s, Req(9, @"tools/call", @{@"name": @"make_available_offline", @"arguments": @{@"paths": @[file], @"wait": @NO}}))[@"result"];
-  CHECK_EQ(r[@"structuredContent"][@"results"][0][@"result"], OOResultRequested);
+  CHECK_EQ(r[@"structuredContent"][@"results"][0][@"result"], @"requested");
 
   // Bad arguments, failed paths and a stopped Dropbox are tool errors the model can read.
   r = Call(s, Req(10, @"tools/call", @{@"name": @"make_online_only", @"arguments": @{@"paths": @"not-an-array"}}))[@"result"];
   CHECK_EQ(r[@"isError"], @YES);
   r = Call(s, Req(11, @"tools/call", @{@"name": @"make_online_only", @"arguments": @{@"paths": @[@"/nonexistent/x"]}}))[@"result"];
   CHECK_EQ(r[@"isError"], @YES);
+  // Arguments of the wrong type are errors, not defaults; null counts as absent. An argument
+  // error is a bare message, so a result with structuredContent got past parsing.
+  NSString *(^argError)(NSString *, NSDictionary *) = ^NSString *(NSString *n, NSDictionary *a) {
+    NSDictionary *res = Call(s, Req(13, @"tools/call", @{@"name": n, @"arguments": a}))[@"result"];
+    return res[@"structuredContent"] ? nil : res[@"content"][0][@"text"];
+  };
+  CHECK_EQ(argError(@"get_sync_status", (@{@"paths": @[dir], @"include_children": @"yes"})), @"include_children must be a boolean");
+  CHECK_EQ(argError(@"make_online_only", (@{@"paths": @[file], @"wait": @1})), @"wait must be a boolean");
+  CHECK_EQ(argError(@"make_online_only", (@{@"paths": @[file], @"timeout_seconds": @"5"})), @"timeout_seconds must be a number from 0 to 600");
+  CHECK_EQ(argError(@"make_online_only", (@{@"paths": @[file], @"timeout_seconds": @YES})), @"timeout_seconds must be a number from 0 to 600");
+  CHECK_EQ(argError(@"make_online_only", (@{@"paths": @[file], @"timeout_seconds": @601})), @"timeout_seconds must be a number from 0 to 600");
+  CHECK(argError(@"make_available_offline", (@{@"paths": @[file], @"wait": [NSNull null], @"extra": @1})) == nil);
+  CHECK_EQ(argError(@"get_sync_status", (@{@"paths": @[@""]})), @"paths must be a non-empty array of path strings");
+
   running = NO;
   r = Call(s, Req(12, @"tools/call", @{@"name": @"get_sync_status", @"arguments": @{@"paths": @[dir]}}))[@"result"];
   CHECK_EQ(r[@"isError"], @YES);
   CHECK([r[@"content"][0][@"text"] containsString:@"not running"]);
+}
+
+
+// The result JSON is a contract: the CLI's --json and the MCP tools' structuredContent both
+// emit it, so each outcome's exact shape is pinned here.
+static void TestResultContract(void) {
+  NSString *dir = TempDir();
+  NSString *file = [dir stringByAppendingPathComponent:@"a.txt"];
+  NSString *sub = [dir stringByAppendingPathComponent:@"sub"];
+  FakeBackend *fake = [FakeBackend new];
+  [fake set:dir to:OOStatusOffline];
+  [fake set:file to:OOStatusLocal];
+  OOMCPServer *s = [[OOMCPServer alloc] initWithConnector:^id<OOBackend> { return fake; } version:@"t"];
+  s.pollInterval = 0;
+  id (^first)(NSString *, NSDictionary *) = ^id(NSString *n, NSDictionary *a) {
+    return Call(s, Req(1, @"tools/call", @{@"name": n, @"arguments": a}))[@"result"][@"structuredContent"][@"results"][0];
+  };
+
+  CHECK_EQ(first(@"get_sync_status", @{@"paths": @[file]}), (@{@"path": file, @"status": @"local"}));
+  CHECK_EQ(first(@"get_sync_status", @{@"paths": @[dir], @"include_children": @YES}), (@{
+    @"path": dir,
+    @"status": @"offline",
+    @"children": @[
+      @{@"path": file, @"name": @"a.txt", @"directory": @NO, @"status": @"local"},
+      @{@"path": sub, @"name": @"sub", @"directory": @YES, @"status": @"none"},
+    ],
+  }));
+  CHECK_EQ(first(@"get_sync_status", @{@"paths": @[@"/nonexistent/x"]}),
+           (@{@"path": @"/nonexistent/x", @"error": @"No such file or directory"}));
+  fake.silent = YES;
+  CHECK_EQ(first(@"get_sync_status", @{@"paths": @[file]}), (@{@"path": file, @"error": @"no reply from Dropbox"}));
+  fake.silent = NO;
+
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file], @"wait": @NO}),
+           (@{@"path": file, @"result": @"requested", @"status": @"local"}));
+  [fake set:file to:OOStatusOnlineOnly];
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file]}),
+           (@{@"path": file, @"result": @"already", @"status": @"online-only"}));
+  [fake.statuses removeObjectForKey:file];
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file], @"wait": @NO}),
+           (@{@"path": file, @"result": @"failed", @"status": @"none", @"error": @"not in a Dropbox folder"}));
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[@"/nonexistent/x"]}),
+           (@{@"path": @"/nonexistent/x", @"result": @"failed", @"error": @"No such file or directory"}));
+  [fake syncing:file reads:1000000 then:OOStatusLocal];
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file], @"timeout_seconds": @0.01}),
+           (@{@"path": file, @"result": @"pending", @"status": @"syncing", @"error": @"still syncing; not requested yet"}));
+
+  // A status Dropbox does not answer is an error, never a status value.
+  fake.silent = YES;
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file]}),
+           (@{@"path": file, @"result": @"failed", @"error": @"no reply from Dropbox"}));
+  fake.silent = NO;
+  [fake.silentPaths addObject:sub];
+  CHECK_EQ(first(@"get_sync_status", @{@"paths": @[dir], @"include_children": @YES})[@"children"][1],
+           (@{@"path": sub, @"name": @"sub", @"directory": @YES, @"error": @"no reply from Dropbox"}));
 }
 
 int main(void) {
@@ -397,6 +507,7 @@ int main(void) {
     TestApply();
     TestChildren();
     TestMCP();
+    TestResultContract();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
   }
