@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import "../src/OODomain.h"
+#import "../src/OODropbox.h"
 #import "../src/OOMCP.h"
 #import "../src/OOService.h"
 
@@ -25,6 +26,10 @@ static int failures = 0, checks = 0;
 @property NSMutableArray<NSArray *> *performed;
 @property int settleAfter;
 @property BOOL silent;
+// Status requests answer, but context-menu requests get no reply.
+@property BOOL menuSilent;
+// Dropbox answers the context-menu request but offers no verbs.
+@property BOOL menuEmpty;
 @property int dropNext;
 // Sets a status outright, dropping any change still in flight.
 - (void)set:(NSString *)path to:(int)status;
@@ -55,8 +60,11 @@ static int failures = 0, checks = 0;
   _inFlight[path] = @[@(status), @(reads)];
 }
 
-- (int)statusOf:(NSString *)path {
-  if (_silent) return OOStatusNoReply;
+- (int)statusOf:(NSString *)path error:(NSString **)error {
+  if (_silent) {
+    if (error) *error = @"no reply from Dropbox";
+    return OOStatusNoReply;
+  }
   NSArray *f = _inFlight[path];
   if (f) {
     int left = [f[1] intValue];
@@ -70,8 +78,12 @@ static int failures = 0, checks = 0;
   return _statuses[path] ? _statuses[path].intValue : OOStatusNone;
 }
 
-- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path {
-  if (_silent) return nil;
+- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path error:(NSString **)error {
+  if (_silent || _menuSilent) {
+    if (error) *error = @"no reply from Dropbox";
+    return nil;
+  }
+  if (_menuEmpty) return @{};
   int s = _statuses[path] ? _statuses[path].intValue : OOStatusNone;
   if (s == OOStatusNone) return @{@"copy_link": @"42"};
   if (s == OOStatusOnlineOnly) return @{@"dod_recall": @"42", @"copy_link": @"42"};
@@ -118,6 +130,54 @@ static void TestParseMenu(void) {
   // Malformed actions are skipped rather than misparsed.
   CHECK(OOParseMenu(@"A~~noinstance|B~~-5|C~~verb-").count == 0);
   CHECK(OOParseMenu(@"").count == 0);
+}
+
+
+static NSData *Archive(void (^fill)(NSKeyedArchiver *)) {
+  NSKeyedArchiver *a = [[NSKeyedArchiver alloc] initRequiringSecureCoding:YES];
+  fill(a);
+  [a finishEncoding];
+  return a.encodedData;
+}
+
+static void TestReplies(void) {
+  NSString *err;
+
+  // A missing reply, an undecodable one and one without the expected key are each named,
+  // never passed off as a status or as "no verbs offered".
+  CHECK(OOStatusFromReply(nil, &err) == OOStatusNoReply);
+  CHECK_EQ(err, @"no reply from Dropbox");
+
+  err = nil;
+  CHECK(OOStatusFromReply([@"garbage" dataUsingEncoding:NSUTF8StringEncoding], &err) == OOStatusNoReply);
+  CHECK([err hasPrefix:@"unreadable reply from Dropbox"]);
+
+  err = nil;
+  NSData *noStatus = Archive(^(NSKeyedArchiver *a) { [a encodeObject:@"x" forKey:@"other"]; });
+  CHECK(OOStatusFromReply(noStatus, &err) == OOStatusNoReply);
+  CHECK_EQ(err, @"reply from Dropbox has no status");
+
+  err = nil;
+  NSData *online = Archive(^(NSKeyedArchiver *a) { [a encodeInt:OOStatusOnlineOnly forKey:@"status"]; });
+  CHECK(OOStatusFromReply(online, &err) == OOStatusOnlineOnly);
+  CHECK(err == nil);
+
+  // Status 0 is a real answer (not in a Dropbox folder), distinct from a missing key.
+  NSData *none = Archive(^(NSKeyedArchiver *a) { [a encodeInt:0 forKey:@"status"]; });
+  CHECK(OOStatusFromReply(none, &err) == OOStatusNone);
+
+  err = nil;
+  CHECK(OOVerbsFromReply(nil, &err) == nil);
+  CHECK_EQ(err, @"no reply from Dropbox");
+
+  err = nil;
+  CHECK(OOVerbsFromReply(noStatus, &err) == nil);
+  CHECK_EQ(err, @"reply from Dropbox has no menu");
+
+  err = nil;
+  NSData *menu = Archive(^(NSKeyedArchiver *a) { [a encodeObject:@"Make online-only~~dod_evict-7" forKey:@"menu"]; });
+  CHECK_EQ(OOVerbsFromReply(menu, &err), (@{@"dod_evict": @"7"}));
+  CHECK(err == nil);
 }
 
 static void TestStatusNames(void) {
@@ -173,6 +233,25 @@ static void TestApply(void) {
   fake.silent = YES;
   r = [svc apply:OOTargetOffline paths:@[file] wait:NO timeout:0][0];
   CHECK_EQ(r[@"error"], @"no reply from Dropbox");
+  fake.silent = NO;
+
+  // An unanswered menu request is a missing reply, not a verb Dropbox declined to offer.
+  [fake set:file to:OOStatusLocal];
+  fake.menuSilent = YES;
+  r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:0][0];
+  CHECK_EQ(r[@"result"], OOResultFailed);
+  CHECK_EQ(r[@"error"], @"no reply from Dropbox");
+  fake.menuSilent = NO;
+
+  // An answered menu without the verb is what "does not offer" means.
+  fake.menuEmpty = YES;
+  r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:0][0];
+  CHECK_EQ(r[@"error"], @"Dropbox does not offer Make online-only for this path");
+  fake.menuEmpty = NO;
+
+  // A status read with no answer carries the reason rather than passing as a status.
+  fake.silent = YES;
+  CHECK_EQ([svc statusOf:file][@"error"], @"no reply from Dropbox");
   fake.silent = NO;
 
   // A path that is still syncing is requested only once it settles, since Dropbox drops
@@ -314,6 +393,7 @@ int main(void) {
   @autoreleasepool {
     TestParseMenu();
     TestStatusNames();
+    TestReplies();
     TestApply();
     TestChildren();
     TestMCP();

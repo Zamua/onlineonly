@@ -19,6 +19,43 @@ enum {
 
 static const NSTimeInterval kReplyTimeout = 10;
 
+// Every status and context-menu reply carries its key, even for paths outside Dropbox, so a
+// reply without it is malformed rather than an answer.
+static NSKeyedUnarchiver *OpenReply(NSData *reply, NSString *key, NSString **error) {
+  if (!reply.length) {
+    if (error) *error = @"no reply from Dropbox";
+    return nil;
+  }
+  NSError *e;
+  NSKeyedUnarchiver *u = [[NSKeyedUnarchiver alloc] initForReadingFromData:reply error:&e];
+  if (!u) {
+    if (error) *error = [NSString stringWithFormat:@"unreadable reply from Dropbox: %@", e.localizedDescription];
+    return nil;
+  }
+  u.requiresSecureCoding = YES;
+  if (![u containsValueForKey:key]) {
+    if (error) *error = [NSString stringWithFormat:@"reply from Dropbox has no %@", key];
+    return nil;
+  }
+  return u;
+}
+
+int OOStatusFromReply(NSData *reply, NSString **error) {
+  NSKeyedUnarchiver *u = OpenReply(reply, @"status", error);
+  return u ? [u decodeIntForKey:@"status"] : OOStatusNoReply;
+}
+
+NSDictionary<NSString *, NSString *> *OOVerbsFromReply(NSData *reply, NSString **error) {
+  NSKeyedUnarchiver *u = OpenReply(reply, @"menu", error);
+  if (!u) return nil;
+  NSString *menu = [u decodeObjectOfClass:[NSString class] forKey:@"menu"];
+  if (!menu) {
+    if (error) *error = [NSString stringWithFormat:@"unreadable reply from Dropbox: %@", u.error.localizedDescription ?: @"menu is not a string"];
+    return nil;
+  }
+  return OOParseMenu(menu);
+}
+
 @interface OODropbox () <NSMachPortDelegate>
 - (instancetype)initWithRemote:(NSPort *)remote;
 @end
@@ -86,23 +123,12 @@ static const NSTimeInterval kReplyTimeout = 10;
   return _reply;
 }
 
-- (NSKeyedUnarchiver *)request:(uint32_t)type payload:(NSDictionary *)payload {
-  NSData *d = [self send:type payload:payload];
-  if (!d.length) return nil;
-  NSKeyedUnarchiver *u = [[NSKeyedUnarchiver alloc] initForReadingFromData:d error:NULL];
-  u.requiresSecureCoding = YES;
-  return u;
+- (int)statusOf:(NSString *)path error:(NSString **)error {
+  return OOStatusFromReply([self send:kStatus payload:@{@"url": [NSURL fileURLWithPath:path]}], error);
 }
 
-- (int)statusOf:(NSString *)path {
-  NSKeyedUnarchiver *u = [self request:kStatus payload:@{@"url": [NSURL fileURLWithPath:path]}];
-  return u ? [u decodeIntForKey:@"status"] : OOStatusNoReply;
-}
-
-- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path {
-  NSKeyedUnarchiver *u = [self request:kContextMenu payload:@{@"pathlist": @[[NSURL fileURLWithPath:path]]}];
-  NSString *menu = [u decodeObjectOfClass:[NSString class] forKey:@"menu"];
-  return menu ? OOParseMenu(menu) : nil;
+- (NSDictionary<NSString *, NSString *> *)verbsFor:(NSString *)path error:(NSString **)error {
+  return OOVerbsFromReply([self send:kContextMenu payload:@{@"pathlist": @[[NSURL fileURLWithPath:path]]}], error);
 }
 
 - (BOOL)perform:(NSString *)verb instance:(NSString *)instance path:(NSString *)path {
@@ -114,7 +140,7 @@ static const NSTimeInterval kReplyTimeout = 10;
 }
 
 - (NSArray<NSString *> *)roots {
-  NSKeyedUnarchiver *u = [self request:kWatchSet payload:@{}];
+  NSKeyedUnarchiver *u = OpenReply([self send:kWatchSet payload:@{}], @"watch_set", NULL);
   NSSet *set = [u decodeObjectOfClasses:[NSSet setWithObjects:[NSSet class], [NSURL class], [NSString class], nil] forKey:@"watch_set"];
   NSMutableArray *paths = [NSMutableArray new];
   for (id url in set)

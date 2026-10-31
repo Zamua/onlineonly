@@ -45,7 +45,9 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
   NSString *err;
   NSString *p = OOResolvePath(path, &err);
   if (!p) return @{@"path": path, @"error": err};
-  return @{@"path": p, @"status": OOStatusName([_backend statusOf:p])};
+  int status = [_backend statusOf:p error:&err];
+  if (status == OOStatusNoReply) return @{@"path": p, @"error": err};
+  return @{@"path": p, @"status": OOStatusName(status)};
 }
 
 - (NSArray<NSDictionary *> *)childrenOf:(NSString *)dir
@@ -76,7 +78,7 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
       @"path": child,
       @"name": name,
       @"directory": @(isDir),
-      @"status": OOStatusName([_backend statusOf:child]),
+      @"status": OOStatusName([_backend statusOf:child error:NULL]),
     }];
   }
   return out;
@@ -112,20 +114,27 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
   while (jobs.count) {
     for (OOJob *job in [jobs copy]) {
       NSMutableDictionary *r = job.result;
-      int status = [_backend statusOf:r[@"path"]];
+      NSString *err;
+      int status = [_backend statusOf:r[@"path"] error:&err];
       r[@"status"] = OOStatusName(status);
       if (status == OOStatusNoReply) {
         r[@"result"] = OOResultFailed;
-        r[@"error"] = @"no reply from Dropbox";
+        r[@"error"] = err;
       } else if (status == want) {
         r[@"result"] = job.sentAt ? OOResultDone : OOResultAlready;
       } else if (status == OOStatusSyncing ||
                  (job.sentAt && -job.sentAt.timeIntervalSinceNow < _resendInterval)) {
         continue;
       } else {
-        // Dropbox offers only the verbs that apply to the path's current state.
-        NSString *instance = [_backend verbsFor:r[@"path"]][verb];
-        if (!instance) {
+        // Dropbox offers only the verbs that apply to the path's current state. No answer at
+        // all is a failed request, not a verb it declined to offer.
+        NSDictionary *verbs = [_backend verbsFor:r[@"path"] error:&err];
+        NSString *instance = verbs[verb];
+        if (!verbs) {
+          if (job.sentAt) continue;
+          r[@"result"] = OOResultFailed;
+          r[@"error"] = err;
+        } else if (!instance) {
           if (job.sentAt) continue;
           r[@"result"] = OOResultFailed;
           r[@"error"] = status == OOStatusNone ? @"not in a Dropbox folder"

@@ -7,7 +7,11 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 ## Layout
 
 - `src/OODomain.{h,m}`: status codes, target actions, menu parsing. Pure.
-- `src/OOBackend.h`: the port the service needs (status, offered actions, perform).
+- `src/OOBackend.h`: the port the service needs (status, offered actions, perform). A
+  missing or malformed reply comes back with an error string, so it is never confused with a
+  real status or an empty set of offered actions. Dropbox's replies always carry their key
+  (`status`, `menu`), even for paths outside Dropbox, so a reply without it is malformed;
+  `OOStatusFromReply`/`OOVerbsFromReply` in `OODropbox.m` decode them and are unit-tested.
 - `src/OODropbox.{h,m}`: the adapter to the Dropbox app. The wire format is described at the
   top of the `.m`; everything Dropbox-specific stays in this file.
 - `src/OOService.{h,m}`: path resolution, folder listing, apply-with-wait (hold while
