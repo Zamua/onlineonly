@@ -4,7 +4,7 @@ CFLAGS ?= -O2
 CFLAGS += -fobjc-arc -Wall -Wextra -Wno-unused-parameter -mmacosx-version-min=11.0
 LDFLAGS += -framework Foundation
 
-LIB = src/OODomain.m src/OODropbox.m src/OOResult.m src/OOService.m src/OOMCP.m
+LIB = src/OODomain.m src/OODropbox.m src/OOResult.m src/OOJob.m src/OOService.m src/OOMCP.m
 HDR = $(wildcard src/*.h)
 
 onlineonly: $(LIB) src/main.m $(HDR)

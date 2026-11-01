@@ -20,8 +20,12 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 - `src/OOResult.{h,m}`: typed results (status report, folder entry and listing, apply result
   with an `OOOutcome`) and their one JSON shape, which the CLI's `--json` and the MCP tools'
   `structuredContent` both emit. `TestResultContract` pins that shape per outcome.
-- `src/OOService.{h,m}`: path resolution, status with an optional folder listing,
-  apply-with-wait (hold while syncing, resend, timeouts).
+- `src/OOJob.{h,m}`: one path's apply lifecycle (Unsent, Sent, Final) as an immutable value
+  whose `-next:` is the only transition. Events are a status read, Dropbox's answer to the
+  request a read asked for, and the deadline; time arrives in the events, so tests feed
+  sequences instead of sleeping.
+- `src/OOService.{h,m}`: path resolution, status with an optional folder listing, and the
+  apply loop: it polls, sends the requests `OOJob` asks for, and times out.
 - `src/OOMCP.{h,m}`: JSON-RPC 2.0 over newline-delimited stdio; tools only. `OOTool` is the
   one tool table: definitions and dispatch are exhaustive switches over it. Arguments are
   parsed once against the schema before anything runs; a present argument of the wrong type
@@ -33,7 +37,7 @@ interface its Finder integration uses. Objective-C, Foundation only, no dependen
 ## Behavior worth knowing
 
 - Dropbox silently drops a request sent while the path is `syncing` (a just-created file or
-  folder). `OOService.apply` holds requests until the path settles and re-sends after
+  folder). `OOJob` holds requests until the path settles and re-sends after
   `resendInterval` if a settled path has not moved. Once one request has gone through, an
   unanswered resend keeps waiting instead of failing the path.
 - Folder requests are recursive. Small trees flip in about a second.
