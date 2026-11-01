@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import "../src/OODropbox.h"
+#import "../src/OOJob.h"
 #import "../src/OOMCP.h"
 #import "../src/OOService.h"
 
@@ -235,7 +236,7 @@ static void TestApply(void) {
   // A change that never lands within the timeout is pending, not failed.
   [fake set:file to:OOStatusOnlineOnly];
   fake.settleAfter = 1000000;
-  r = [svc apply:OOTargetOffline paths:@[file] wait:YES timeout:0.05][0];
+  r = [svc apply:OOTargetOffline paths:@[file] wait:YES timeout:0][0];
   CHECK(r.outcome == OOOutcomePending);
 
   // Paths outside Dropbox, missing paths and a silent Dropbox each fail with a reason.
@@ -295,35 +296,92 @@ static void TestApply(void) {
   // A path that keeps syncing past the hold is pending and was never requested.
   [fake.requested removeAllObjects];
   [fake syncing:file reads:1000000 then:OOStatusLocal];
-  svc.settleTimeout = 0.05;
+  svc.settleTimeout = 0;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:NO timeout:5][0];
   CHECK(r.outcome == OOOutcomePending);
   CHECK(fake.requested.count == 0);
 
-  // A dropped request is re-sent once the settled path has not moved for resendInterval.
+  // A dropped request is re-sent (resend timing itself is pinned in TestJob).
   [fake set:file to:OOStatusLocal];
   fake.dropNext = 1;
-  svc.resendInterval = 0.01;
+  fake.settleAfter = 0;
+  svc.resendInterval = 0;
   r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:5][0];
   CHECK(r.outcome == OOOutcomeDone);
   CHECK(fake.requested.count == 2);
-
-  // Once a request went through, an unanswered resend keeps waiting rather than failing.
-  [fake.requested removeAllObjects];
-  [fake set:file to:OOStatusLocal];
-  fake.dropNext = 1;
-  fake.acks = 1;
-  r = [svc apply:OOTargetOnlineOnly paths:@[file] wait:YES timeout:0.1][0];
-  CHECK(r.outcome == OOOutcomePending);
-  CHECK(r.error == nil);
-  CHECK(fake.requested.count == 1);
-  fake.acks = -1;
 
   // Results keep input order across mixed outcomes.
   [fake set:file to:OOStatusOffline];
   NSArray<OOApplyResult *> *rs = [svc apply:OOTargetOffline paths:@[@"/nonexistent/x", file] wait:NO timeout:0];
   CHECK(rs[0].outcome == OOOutcomeFailed);
   CHECK(rs[1].outcome == OOOutcomeAlready);
+}
+
+// The apply lifecycle as event sequences, with time passed in.
+static void TestJob(void) {
+  NSDate *t0 = [NSDate dateWithTimeIntervalSince1970:1000];
+  NSDate *(^at)(NSTimeInterval) = ^(NSTimeInterval s) { return [t0 dateByAddingTimeInterval:s]; };
+  OOApplyPolicy waiting = {.target = OOTargetOnlineOnly, .wait = YES, .resendInterval = 15};
+  OOApplyPolicy once = {.target = OOTargetOnlineOnly, .wait = NO, .resendInterval = 15};
+  BOOL request = NO;
+
+  // Unsent, settled: ask. Acknowledged with wait: Sent. Target reached: done.
+  OOJob *j = [OOJob unsent:@"/p"];
+  j = [j next:[OOJobEvent polledStatus:OOStatusLocal at:t0] policy:waiting request:&request];
+  CHECK(request && j.phase == OOJobUnsent);
+  j = [j next:[OOJobEvent answered:OORequestSent error:nil at:t0] policy:waiting request:&request];
+  CHECK(!request && j.phase == OOJobSent);
+  j = [j next:[OOJobEvent polledStatus:OOStatusOnlineOnly at:at(1)] policy:waiting request:&request];
+  CHECK(j.phase == OOJobFinal && j.result.outcome == OOOutcomeDone);
+
+  // A Sent path that has not moved is asked again only once resendInterval has passed, and
+  // an unanswered resend leaves it Sent with the clock where it was.
+  j = [[[OOJob unsent:@"/p"] next:[OOJobEvent polledStatus:OOStatusLocal at:t0] policy:waiting request:&request]
+          next:[OOJobEvent answered:OORequestSent error:nil at:t0] policy:waiting request:&request];
+  j = [j next:[OOJobEvent polledStatus:OOStatusLocal at:at(14.9)] policy:waiting request:&request];
+  CHECK(!request && j.phase == OOJobSent);
+  j = [j next:[OOJobEvent polledStatus:OOStatusLocal at:at(15)] policy:waiting request:&request];
+  CHECK(request);
+  j = [j next:[OOJobEvent answered:OORequestUnanswered error:@"no reply from Dropbox" at:at(15)] policy:waiting request:&request];
+  CHECK(j.phase == OOJobSent);
+  j = [j next:[OOJobEvent polledStatus:OOStatusLocal at:at(16)] policy:waiting request:&request];
+  CHECK(request);
+  j = [j next:[OOJobEvent timedOut] policy:waiting request:&request];
+  CHECK(j.result.outcome == OOOutcomePending && j.result.error == nil && j.result.status == OOStatusLocal);
+
+  // Syncing holds the request, and a timeout then reports it was never sent.
+  j = [[OOJob unsent:@"/p"] next:[OOJobEvent polledStatus:OOStatusSyncing at:t0] policy:once request:&request];
+  CHECK(!request && j.phase == OOJobUnsent);
+  j = [j next:[OOJobEvent timedOut] policy:once request:&request];
+  CHECK(j.result.outcome == OOOutcomePending);
+  CHECK_EQ(j.result.error, @"still syncing; not requested yet");
+
+  // Without wait, an acknowledged request is final.
+  j = [[[OOJob unsent:@"/p"] next:[OOJobEvent polledStatus:OOStatusLocal at:t0] policy:once request:&request]
+          next:[OOJobEvent answered:OORequestSent error:nil at:t0] policy:once request:&request];
+  CHECK(j.result.outcome == OOOutcomeRequested && j.result.status == OOStatusLocal);
+
+  // Already there; a first request refused or unanswered; a status Dropbox does not give.
+  j = [[OOJob unsent:@"/p"] next:[OOJobEvent polledStatus:OOStatusOnlineOnly at:t0] policy:once request:&request];
+  CHECK(!request && j.result.outcome == OOOutcomeAlready);
+  OOJob *(^refused)(OOStatus, OORequestResult) = ^(OOStatus s, OORequestResult r) {
+    BOOL ask;
+    return [[[OOJob unsent:@"/p"] next:[OOJobEvent polledStatus:s at:t0] policy:once request:&ask]
+               next:[OOJobEvent answered:r error:@"no reply from Dropbox" at:t0] policy:once request:&ask];
+  };
+  CHECK_EQ(refused(OOStatusNone, OORequestNotOffered).result.error, @"not in a Dropbox folder");
+  CHECK_EQ(refused(OOStatusLocal, OORequestNotOffered).result.error, @"Dropbox does not offer Make online-only for this path");
+  CHECK_EQ(refused(OOStatusLocal, OORequestUnanswered).result.error, @"no reply from Dropbox");
+  j = [[OOJob unsent:@"/p"] next:[OOJobEvent polledError:@"no reply from Dropbox"] policy:once request:&request];
+  CHECK(j.result.outcome == OOOutcomeFailed && !j.result.hasStatus);
+
+  // Events with nothing to act on: a final job, an answer nobody asked for, a timeout before
+  // any status.
+  OOJob *done = [OOJob path:@"/x" failure:@"No such file or directory"];
+  CHECK([done next:[OOJobEvent polledStatus:OOStatusLocal at:t0] policy:once request:&request] == done && !request);
+  j = [OOJob unsent:@"/p"];
+  CHECK([j next:[OOJobEvent answered:OORequestSent error:nil at:t0] policy:once request:&request] == j);
+  CHECK_EQ([j next:[OOJobEvent timedOut] policy:once request:&request].result.error, @"no status from Dropbox before the timeout");
 }
 
 static void TestChildren(void) {
@@ -486,7 +544,7 @@ static void TestResultContract(void) {
   CHECK_EQ(first(@"make_online_only", @{@"paths": @[@"/nonexistent/x"]}),
            (@{@"path": @"/nonexistent/x", @"result": @"failed", @"error": @"No such file or directory"}));
   [fake syncing:file reads:1000000 then:OOStatusLocal];
-  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file], @"timeout_seconds": @0.01}),
+  CHECK_EQ(first(@"make_online_only", @{@"paths": @[file], @"timeout_seconds": @0}),
            (@{@"path": file, @"result": @"pending", @"status": @"syncing", @"error": @"still syncing; not requested yet"}));
 
   // A status Dropbox does not answer is an error, never a status value.
@@ -505,6 +563,7 @@ int main(void) {
     TestStatusNames();
     TestReplies();
     TestApply();
+    TestJob();
     TestChildren();
     TestMCP();
     TestResultContract();

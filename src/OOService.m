@@ -1,4 +1,5 @@
 #import "OOService.h"
+#import "OOJob.h"
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -12,17 +13,6 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
   }
   return @(buf);
 }
-
-// One path's progress through apply.
-@interface OOJob : NSObject
-@property NSString *path;
-@property(nullable) OOApplyResult *result;  // set once the outcome is final
-@property(nullable) NSDate *sentAt;
-@property OOStatus status;  // last read
-@end
-
-@implementation OOJob
-@end
 
 @implementation OOService {
   id<OOBackend> _backend;
@@ -82,31 +72,26 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
                               paths:(NSArray<NSString *> *)paths
                                wait:(BOOL)wait
                             timeout:(NSTimeInterval)timeout {
+  OOApplyPolicy policy = {.target = target, .wait = wait, .resendInterval = _resendInterval};
   NSMutableArray<OOJob *> *jobs = [NSMutableArray new];
-  NSMutableArray<OOJob *> *open = [NSMutableArray new];
   for (NSString *path in paths) {
-    OOJob *job = [OOJob new];
     NSString *err;
     NSString *p = OOResolvePath(path, &err);
-    job.path = p ?: path;
-    [jobs addObject:job];
-    if (p) [open addObject:job];
-    else job.result = [OOApplyResult path:path failure:err];
+    [jobs addObject:p ? [OOJob unsent:p] : [OOJob path:path failure:err]];
   }
 
-  // Dropbox drops a request for a path it is still syncing, so a request is held until the
-  // path settles, and re-sent if a settled path has not moved after resendInterval.
+  // Without wait, a path still syncing is held at most settleTimeout before it is pending.
   NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:wait ? timeout : MIN(timeout, _settleTimeout)];
-  while (open.count) {
-    for (OOJob *job in [open copy]) {
-      [self advance:job toward:target wait:wait];
-      if (job.result) [open removeObject:job];
+  for (;;) {
+    BOOL open = NO;
+    for (NSUInteger i = 0; i < jobs.count; i++) {
+      if (jobs[i].phase == OOJobFinal) continue;
+      jobs[i] = [self poll:jobs[i] policy:policy];
+      open = open || jobs[i].phase != OOJobFinal;
     }
-    if (!open.count) break;
+    if (!open) break;
     if (deadline.timeIntervalSinceNow <= 0) {
-      for (OOJob *job in open)
-        job.result = [OOApplyResult path:job.path outcome:OOOutcomePending status:job.status
-                                   error:job.sentAt ? nil : @"still syncing; not requested yet"];
+      for (NSUInteger i = 0; i < jobs.count; i++) jobs[i] = [jobs[i] next:[OOJobEvent timedOut] policy:policy request:NULL];
       break;
     }
     [NSThread sleepForTimeInterval:MIN(_pollInterval, MAX(deadline.timeIntervalSinceNow, 0))];
@@ -117,39 +102,18 @@ NSString *OOResolvePath(NSString *path, NSString **error) {
   return results;
 }
 
-// One poll of a path; sets job.result once the outcome is final.
-- (void)advance:(OOJob *)job toward:(OOTarget)target wait:(BOOL)wait {
-  NSString *err;
+// One status read, and the request it calls for.
+- (OOJob *)poll:(OOJob *)job policy:(OOApplyPolicy)policy {
   OOStatus status;
-  if (![_backend status:&status of:job.path error:&err]) {
-    job.result = [OOApplyResult path:job.path failure:err];
-    return;
-  }
-  job.status = status;
-  OOApplyResult *(^finish)(OOOutcome, NSString *) = ^(OOOutcome outcome, NSString *error) {
-    return [OOApplyResult path:job.path outcome:outcome status:status error:error];
-  };
-  if (status == OOTargetStatus(target)) {
-    job.result = finish(job.sentAt ? OOOutcomeDone : OOOutcomeAlready, nil);
-    return;
-  }
-  if (status == OOStatusSyncing || (job.sentAt && -job.sentAt.timeIntervalSinceNow < _resendInterval)) return;
-
-  // After a first request went through, a failed resend is not the final word: keep waiting.
-  switch ([_backend request:target for:job.path error:&err]) {
-    case OORequestSent:
-      job.sentAt = [NSDate date];
-      if (!wait) job.result = finish(OOOutcomeRequested, nil);
-      return;
-    case OORequestUnanswered:
-      if (!job.sentAt) job.result = finish(OOOutcomeFailed, err);
-      return;
-    case OORequestNotOffered:
-      if (!job.sentAt)
-        job.result = finish(OOOutcomeFailed, status == OOStatusNone ? @"not in a Dropbox folder"
-                                                                    : [NSString stringWithFormat:@"Dropbox does not offer %@ for this path", OOTargetTitle(target)]);
-      return;
-  }
+  NSString *err;
+  OOJobEvent *read = [_backend status:&status of:job.path error:&err] ? [OOJobEvent polledStatus:status at:[NSDate date]]
+                                                                      : [OOJobEvent polledError:err];
+  BOOL request = NO;
+  job = [job next:read policy:policy request:&request];
+  if (!request) return job;
+  err = nil;
+  OORequestResult answer = [_backend request:policy.target for:job.path error:&err];
+  return [job next:[OOJobEvent answered:answer error:err at:[NSDate date]] policy:policy request:NULL];
 }
 
 @end
